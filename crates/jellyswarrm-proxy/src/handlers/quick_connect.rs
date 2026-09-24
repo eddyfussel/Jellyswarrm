@@ -104,21 +104,49 @@ impl QuickConnectStorage {
         }
     }
 
-    pub fn store_session(&self, session: QuickConnectSession) {
+    /// Store a session, returning it with its final code.
+    ///
+    /// A session is indexed under both its secret and its code so it can be
+    /// looked up by either. Because clients pick their own moment to poll, the
+    /// code must stay unique across all live sessions: otherwise a second
+    /// `Initiate` could repoint a victim's pending code at the attacker's
+    /// session, and approving "their" code would approve the attacker's. The
+    /// code is therefore (re)generated under the lock until it is free, so the
+    /// caller must use the returned session's code, not the one it passed in.
+    pub fn store_session(&self, mut session: QuickConnectSession) -> QuickConnectSession {
         let mut sessions = self.sessions_lock();
+        while sessions
+            .get(&session.code)
+            .is_some_and(|existing| !existing.is_expired())
+        {
+            session.code = generate_code();
+        }
         sessions.insert(session.secret.clone(), session.clone());
-        sessions.insert(session.code.clone(), session);
+        sessions.insert(session.code.clone(), session.clone());
+        session
     }
 
-    pub fn get_session(&self, key: &str) -> Option<QuickConnectSession> {
+    /// Look up a session by its secret.
+    ///
+    /// A session is also indexed under its 6-digit code, but the code must
+    /// never be accepted as a secret: it is short, guessable and meant to be
+    /// shown to the user, while the secret authenticates the polling device.
+    /// The match is only honoured when the stored entry's secret equals the
+    /// key, which rejects a code passed in the secret's place (a code can never
+    /// equal a UUID secret).
+    pub fn get_session(&self, secret: &str) -> Option<QuickConnectSession> {
         let mut sessions = self.sessions_lock();
 
-        if let Some(session) = sessions.get(key) {
+        if let Some(session) = sessions.get(secret) {
             if session.is_expired() {
-                let secret = session.secret.clone();
+                let stored_secret = session.secret.clone();
                 let code = session.code.clone();
-                sessions.remove(&secret);
+                sessions.remove(&stored_secret);
                 sessions.remove(&code);
+                return None;
+            }
+
+            if session.secret != secret {
                 return None;
             }
 
@@ -128,6 +156,11 @@ impl QuickConnectStorage {
         None
     }
 
+    /// Approve/update a session addressed by its 6-digit code.
+    ///
+    /// Mirrors [`Self::get_session`]: a secret must never be accepted here in
+    /// the code's place, so the update only applies when the stored entry's
+    /// code equals the key.
     pub fn update_session_by_code(
         &self,
         code: &str,
@@ -143,6 +176,10 @@ impl QuickConnectStorage {
                 return false;
             }
 
+            if session.code != code {
+                return false;
+            }
+
             let mut updated_session = session;
             updater(&mut updated_session);
 
@@ -155,8 +192,17 @@ impl QuickConnectStorage {
         false
     }
 
+    /// Remove a session addressed by its secret.
+    ///
+    /// As in [`Self::get_session`], a code must not stand in for a secret: a
+    /// looked-up entry whose secret differs from the key is a code hit and is
+    /// left untouched.
     pub fn remove_session(&self, secret: &str) -> Option<QuickConnectSession> {
         let mut sessions = self.sessions_lock();
+
+        if sessions.get(secret).is_some_and(|s| s.secret != secret) {
+            return None;
+        }
 
         if let Some(session) = sessions.remove(secret) {
             sessions.remove(&session.code);
@@ -338,7 +384,7 @@ pub async fn handle_quick_connect_initiate(
         app_version,
     );
 
-    state.quick_connect.store_session(session.clone());
+    let session = state.quick_connect.store_session(session);
     state.quick_connect.cleanup_expired();
 
     Ok(Json(session))
@@ -369,18 +415,23 @@ pub async fn handle_quick_connect_authorize(
     }
 }
 
+/// Resolve the user approving a Quick Connect code, from the caller's token.
+///
+/// The user id is always taken from the authenticated virtual token, never
+/// from the request: a caller-supplied `userId` used to be trusted verbatim,
+/// which let anyone approve their own code on behalf of any user id and then
+/// collect that user's token. A `userId` may still be sent (clients echo the
+/// one they logged in with) but only to be checked against the token's user;
+/// a mismatch is rejected. The canonical id from the token is returned so it,
+/// not a client-formatted value, is stored on the session.
 async fn resolve_authorize_user_id(
     state: &AppState,
     headers: &HeaderMap,
     user_id: Option<String>,
 ) -> Result<String, StatusCode> {
-    if let Some(user_id) = user_id {
-        return Ok(user_id);
-    }
-
     let token = extract_virtual_token(headers).ok_or_else(|| {
-        warn!("Quick Connect authorize called without userId and without a virtual token");
-        StatusCode::BAD_REQUEST
+        warn!("Quick Connect authorize called without a virtual token");
+        StatusCode::UNAUTHORIZED
     })?;
 
     let user = state
@@ -393,7 +444,24 @@ async fn resolve_authorize_user_id(
         })?
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
+    if let Some(requested) = user_id {
+        if !user_ids_match(&requested, &user.id) {
+            warn!("Quick Connect authorize userId does not match the authenticated user");
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+
     Ok(user.id)
+}
+
+/// Compare two Jellyfin user ids. Ids are 32-hex-char UUIDs but clients may
+/// send them hyphenated, so parse both as UUIDs when possible and fall back to
+/// a case-insensitive string compare.
+fn user_ids_match(a: &str, b: &str) -> bool {
+    match (Uuid::parse_str(a), Uuid::parse_str(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a.eq_ignore_ascii_case(b),
+    }
 }
 
 fn extract_virtual_token(headers: &HeaderMap) -> Option<String> {
@@ -1046,5 +1114,192 @@ mod tests {
             "existing web session should remain available"
         );
         assert_eq!(web_sessions[0].0.jellyfin_token, "web-upstream-token");
+    }
+
+    fn test_session(secret: &str, code: &str) -> QuickConnectSession {
+        QuickConnectSession::new(
+            secret.to_string(),
+            code.to_string(),
+            "device-id".to_string(),
+            "Device".to_string(),
+            "App".to_string(),
+            "1.0.0".to_string(),
+        )
+    }
+
+    fn authorization_header(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!(
+                "MediaBrowser Client=\"App\", Device=\"Device\", DeviceId=\"device-id\", Version=\"1.0.0\", Token=\"{token}\""
+            ))
+            .unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn get_session_rejects_the_code_used_as_a_secret() {
+        let storage = QuickConnectStorage::new();
+        let stored = storage.store_session(test_session(
+            "11111111-1111-4111-8111-111111111111",
+            "123456",
+        ));
+
+        // The code must never unlock a session in the secret's place.
+        assert!(storage.get_session(&stored.code).is_none());
+        assert!(storage.get_session(&stored.secret).is_some());
+    }
+
+    #[test]
+    fn update_by_code_rejects_the_secret_used_as_a_code() {
+        let storage = QuickConnectStorage::new();
+        let stored = storage.store_session(test_session(
+            "22222222-2222-4222-8222-222222222222",
+            "234567",
+        ));
+
+        assert!(!storage.update_session_by_code(&stored.secret, |s| s.authenticated = true));
+        assert!(storage.update_session_by_code(&stored.code, |s| s.authenticated = true));
+    }
+
+    #[test]
+    fn remove_session_ignores_a_code() {
+        let storage = QuickConnectStorage::new();
+        let stored = storage.store_session(test_session(
+            "33333333-3333-4333-8333-333333333333",
+            "345678",
+        ));
+
+        assert!(storage.remove_session(&stored.code).is_none());
+        assert!(storage.get_session(&stored.secret).is_some());
+        assert!(storage.remove_session(&stored.secret).is_some());
+    }
+
+    #[test]
+    fn store_session_regenerates_a_colliding_code() {
+        let storage = QuickConnectStorage::new();
+        let first = storage.store_session(test_session(
+            "44444444-4444-4444-8444-444444444444",
+            "456789",
+        ));
+        assert_eq!(first.code, "456789");
+
+        // A second session initiated with the same code must not steal it.
+        let second = storage.store_session(test_session(
+            "55555555-5555-4555-8555-555555555555",
+            "456789",
+        ));
+        assert_ne!(second.code, "456789");
+        assert_eq!(
+            storage.get_session(&first.secret).unwrap().code,
+            "456789",
+            "the first session keeps its code"
+        );
+        assert_eq!(
+            storage.get_session(&second.secret).unwrap().code,
+            second.code
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_requires_a_token_even_with_a_user_id() {
+        let state = create_test_app_state().await;
+        let stored = state.quick_connect.store_session(test_session(
+            "66666666-6666-4666-8666-666666666666",
+            "567890",
+        ));
+
+        let result = handle_quick_connect_authorize(
+            Query(AuthorizeQuery {
+                code: stored.code.clone(),
+                user_id: Some("deadbeefdeadbeefdeadbeefdeadbeef".to_string()),
+            }),
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !state
+                .quick_connect
+                .get_session(&stored.secret)
+                .unwrap()
+                .authenticated
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_rejects_a_foreign_user_id() {
+        let state = create_test_app_state().await;
+        let user = state
+            .user_authorization
+            .get_or_create_user("owner", &"pass".into())
+            .await
+            .unwrap();
+        let stored = state.quick_connect.store_session(test_session(
+            "77777777-7777-4777-8777-777777777777",
+            "678901",
+        ));
+
+        let result = handle_quick_connect_authorize(
+            Query(AuthorizeQuery {
+                code: stored.code.clone(),
+                user_id: Some(Uuid::new_v4().simple().to_string()),
+            }),
+            axum::extract::State(state.clone()),
+            authorization_header(&user.virtual_key),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
+        let session = state.quick_connect.get_session(&stored.secret).unwrap();
+        assert!(!session.authenticated);
+        assert!(session.user_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn authorize_accepts_a_hyphenated_user_id_and_stores_the_canonical_id() {
+        let state = create_test_app_state().await;
+        let user = state
+            .user_authorization
+            .get_or_create_user("owner", &"pass".into())
+            .await
+            .unwrap();
+        let hyphenated = Uuid::parse_str(&user.id).unwrap().hyphenated().to_string();
+        let stored = state.quick_connect.store_session(test_session(
+            "88888888-8888-4888-8888-888888888888",
+            "789012",
+        ));
+
+        let result = handle_quick_connect_authorize(
+            Query(AuthorizeQuery {
+                code: stored.code.clone(),
+                user_id: Some(hyphenated),
+            }),
+            axum::extract::State(state.clone()),
+            authorization_header(&user.virtual_key),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let session = state.quick_connect.get_session(&stored.secret).unwrap();
+        assert!(session.authenticated);
+        assert_eq!(
+            session.user_id.as_deref(),
+            Some(user.id.as_str()),
+            "the canonical id from the token is stored, not the client's format"
+        );
+    }
+
+    #[test]
+    fn user_ids_match_across_formats() {
+        let simple = "deadbeefdeadbeefdeadbeefdeadbeef";
+        let hyphenated = "DEADBEEF-DEAD-BEEF-DEAD-BEEFDEADBEEF";
+        assert!(user_ids_match(simple, hyphenated));
+        assert!(user_ids_match(simple, simple));
+        assert!(!user_ids_match(simple, "feedfacefeedfacefeedfacefeedface"));
     }
 }
