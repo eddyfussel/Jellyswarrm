@@ -21,6 +21,7 @@ pub struct LoginTemplate {
     next: Option<String>,
     ui_route: String,
     oidc_enabled: bool,
+    oidc_admin_enabled: bool,
 }
 
 // This allows us to extract the "next" field from the query string. We use this
@@ -105,6 +106,13 @@ mod get {
                 next,
                 ui_route: state.get_ui_route().await,
                 oidc_enabled: state.config.read().await.oidc.is_some(),
+                oidc_admin_enabled: state
+                    .config
+                    .read()
+                    .await
+                    .oidc
+                    .as_ref()
+                    .is_some_and(|oidc| oidc.admin_group.is_some()),
             }
             .render()
             .unwrap(),

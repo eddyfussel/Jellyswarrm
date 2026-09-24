@@ -1,11 +1,12 @@
 //! OpenID Connect login for the web UI (authorization code flow with PKCE).
 //!
 //! The provider only authenticates; it never creates accounts or picks one by
-//! name. A member of the configured admin group logs in as the admin. Everyone
-//! else must first link their provider identity (issuer + subject) to their
-//! Jellyswarrm account while logged in with its password; afterwards SSO logs
-//! them into exactly that account. Provider usernames are never trusted, as
-//! users may be able to change them.
+//! name. Which account to enter is chosen on the login page, because one
+//! person can be both: "as admin" requires membership in the configured admin
+//! group; otherwise the user must have linked their provider identity (issuer
+//! and subject) to their Jellyswarrm account while logged in with its
+//! password, and SSO then logs them into exactly that account. Provider
+//! usernames are never trusted, as users may be able to change them.
 
 use std::time::Duration;
 
@@ -56,11 +57,17 @@ struct OidcFlow {
     /// Set when the flow links the identity to this logged-in user instead of
     /// logging in.
     link_user_id: Option<String>,
+    /// Log in as the admin (requires the admin group) rather than as the
+    /// linked user. Chosen up front, because one person can be both.
+    #[serde(default)]
+    as_admin: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct LoginQuery {
     next: Option<String>,
+    #[serde(default)]
+    admin: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,6 +152,7 @@ async fn start_flow(
     messages: Messages,
     next: Option<String>,
     link_user_id: Option<String>,
+    as_admin: bool,
 ) -> Response {
     let login_url = format!("/{}/login", state.get_ui_route().await);
     let Some(config) = state.config.read().await.oidc.clone() else {
@@ -177,6 +185,7 @@ async fn start_flow(
         pkce_verifier: pkce_verifier.secret().clone(),
         next,
         link_user_id,
+        as_admin,
     };
     if let Err(e) = session.insert(FLOW_SESSION_KEY, flow).await {
         warn!("Failed to store OIDC flow state: {e}");
@@ -191,9 +200,9 @@ pub async fn login(
     State(state): State<AppState>,
     session: Session,
     messages: Messages,
-    Query(LoginQuery { next }): Query<LoginQuery>,
+    Query(LoginQuery { next, admin }): Query<LoginQuery>,
 ) -> Response {
-    start_flow(&state, &session, messages, next, None).await
+    start_flow(&state, &session, messages, next, None, admin).await
 }
 
 /// Link the logged-in user's account to their provider identity.
@@ -211,7 +220,7 @@ pub async fn link(
     if user.role != UserRole::User {
         return StatusCode::FORBIDDEN.into_response();
     }
-    start_flow(&state, &session, messages, None, Some(user.id)).await
+    start_flow(&state, &session, messages, None, Some(user.id), false).await
 }
 
 pub async fn callback(
@@ -258,7 +267,7 @@ pub async fn callback(
     }
 
     let logged_in = match verified {
-        Ok(identity) => log_in(&state, &mut auth_session, identity).await,
+        Ok(identity) => log_in(&state, &mut auth_session, identity, flow.as_admin).await,
         Err(e) => Err(e),
     };
     match logged_in {
@@ -336,6 +345,7 @@ async fn log_in(
     state: &AppState,
     auth_session: &mut AuthSession,
     identity: VerifiedIdentity,
+    as_admin: bool,
 ) -> anyhow::Result<User> {
     let admin_group = state
         .config
@@ -345,7 +355,10 @@ async fn log_in(
         .as_ref()
         .and_then(|config| config.admin_group.clone());
 
-    let user_id = if is_admin(&identity.groups, admin_group.as_deref()) {
+    let user_id = if as_admin {
+        if !is_admin(&identity.groups, admin_group.as_deref()) {
+            return Err(anyhow!("admin login requested outside the admin group"));
+        }
         "admin".to_string()
     } else {
         state
