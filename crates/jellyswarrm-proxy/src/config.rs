@@ -622,6 +622,27 @@ mod tests {
     }
 
     #[test]
+    fn env_configures_oidc() {
+        let cfg = config_from_env(&[
+            ("JELLYSWARRM_OIDC__ISSUER_URL", "https://idp.example"),
+            ("JELLYSWARRM_OIDC__CLIENT_ID", "jellyswarrm"),
+            (
+                "JELLYSWARRM_OIDC__REDIRECT_URL",
+                "https://swarm.example/ui/oidc/callback",
+            ),
+            ("JELLYSWARRM_OIDC__ADMIN_GROUP", "admins"),
+        ])
+        .unwrap();
+
+        let oidc = cfg.oidc.unwrap();
+        assert_eq!(oidc.issuer_url, "https://idp.example");
+        assert_eq!(oidc.client_id, "jellyswarrm");
+        assert_eq!(oidc.redirect_url, "https://swarm.example/ui/oidc/callback");
+        assert_eq!(oidc.admin_group.as_deref(), Some("admins"));
+        assert!(oidc.client_secret.is_none());
+    }
+
+    #[test]
     fn env_ignores_kubernetes_service_links() {
         let cfg = config_from_env(&[
             ("JELLYSWARRM_PORT", "tcp://10.43.254.147:3000"),
