@@ -14,6 +14,7 @@ use crate::{
     user_authorization_service::{LocalCredential, UserAuthorizationService},
 };
 
+mod oidc;
 mod routes;
 
 pub use routes::router;

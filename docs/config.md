@@ -44,3 +44,22 @@ The table below lists all available configuration options:
 - The `session_key` is generated as a secure 64-byte key if not specified, and is stored in the config file for reuse.  
 - Each server now has its own streaming mode (`Redirect` or `Proxy`). For preconfigured servers, omit `media_streaming_mode` to use the default `Redirect`.
 - Configuration files are resolved from the data directory (`./data` by default), which can be overridden with `JELLYSWARRM_DATA_DIR`.
+
+---
+
+## Single sign-on (OpenID Connect)
+
+The web UI can additionally log in through an OpenID Connect provider (authorization code flow with PKCE). Add an `[oidc]` section to `jellyswarrm.toml`:
+
+```toml
+[oidc]
+issuer_url = "https://auth.example.com"
+client_id = "jellyswarrm"
+client_secret = "..."            # omit for a public client
+redirect_url = "https://jellyswarrm.example.com/ui/oidc/callback"
+admin_group = "jellyswarrm-admins" # optional
+```
+
+- Register `redirect_url` exactly as written at the provider; it is not derived from the request, so a TLS-terminating proxy cannot change its scheme. The path is `/<ui_route>/oidc/callback` (with `url_prefix` in front if one is set).
+- The scopes `openid groups` are requested. Members of `admin_group` (from the `groups` claim) log in as the admin. Everyone else logs in to the Jellyswarrm account they have **linked**: sign in once with the account's password, open **Profile → Link single sign-on** and complete the provider login. The link stores the provider's issuer and subject, never a username, so renaming an account at the provider cannot redirect a login to someone else's account. No accounts are created; users get their Jellyswarrm account as before, by logging in once from a Jellyfin client.
+- Native Jellyfin apps cannot follow a browser login. They sign in with Quick Connect instead: pick "Quick Connect" in the app, then enter the code under **Quick Connect** in the web UI after signing in there. The device is logged in with the servers connected to that account. The admin account has no media access and cannot approve codes.

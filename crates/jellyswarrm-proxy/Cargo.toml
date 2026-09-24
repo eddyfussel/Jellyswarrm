@@ -52,6 +52,7 @@ percent-encoding = { workspace = true }
 serde_default = { workspace = true }
 
 axum-login = { workspace = true }
+openidconnect = { workspace = true }
 axum-messages = { workspace = true }
 tower-sessions = { workspace = true }
 tower-sessions-sqlx-store = { workspace = true }

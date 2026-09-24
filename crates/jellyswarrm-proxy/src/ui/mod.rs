@@ -41,6 +41,25 @@ async fn require_admin(
     }
 }
 
+/// CSRF guard for state-changing UI requests: the browser-sent `Origin` must
+/// name the host the request was addressed to. SameSite=Lax cookies alone do
+/// not stop sibling subdomains, which count as the same site.
+pub(crate) fn is_same_origin(headers: &hyper::HeaderMap) -> bool {
+    let header = |name| headers.get(name).and_then(|value| value.to_str().ok());
+    let (Some(origin), Some(host)) = (header(hyper::header::ORIGIN), header(hyper::header::HOST))
+    else {
+        return false;
+    };
+    url::Url::parse(origin).is_ok_and(|origin| {
+        let authority = match (origin.host_str(), origin.port()) {
+            (Some(name), Some(port)) => format!("{name}:{port}"),
+            (Some(name), None) => name.to_string(),
+            _ => return false,
+        };
+        authority.eq_ignore_ascii_case(host)
+    })
+}
+
 async fn resource_handler(Path(path): Path<String>) -> impl IntoResponse {
     if let Some(file) = Resources::get(&path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
@@ -197,6 +216,11 @@ pub fn ui_routes() -> axum::Router<AppState> {
             post(user::profile::post_user_password),
         )
         .route(
+            "/user/quick-connect",
+            get(user::quick_connect::get_quick_connect)
+                .post(user::quick_connect::post_quick_connect),
+        )
+        .route(
             "/user/servers/{id}/status",
             get(user::servers::check_user_server_status),
         )
@@ -208,4 +232,40 @@ pub fn ui_routes() -> axum::Router<AppState> {
         .route_layer(login_required!(Backend, login_url = "/ui/login"))
         .route("/resources/{*path}", get(resource_handler))
         .merge(auth::router())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_same_origin;
+
+    fn headers(host: &str, origin: Option<&str>) -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(hyper::header::HOST, host.parse().unwrap());
+        if let Some(origin) = origin {
+            headers.insert(hyper::header::ORIGIN, origin.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn same_origin_requires_matching_origin_header() {
+        assert!(is_same_origin(&headers(
+            "swarm.example",
+            Some("https://swarm.example")
+        )));
+        assert!(is_same_origin(&headers(
+            "localhost:3000",
+            Some("http://localhost:3000")
+        )));
+        assert!(!is_same_origin(&headers(
+            "swarm.example",
+            Some("https://evil.swarm.example")
+        )));
+        assert!(!is_same_origin(&headers(
+            "swarm.example",
+            Some("https://swarm.example:8443")
+        )));
+        assert!(!is_same_origin(&headers("swarm.example", Some("null"))));
+        assert!(!is_same_origin(&headers("swarm.example", None)));
+    }
 }

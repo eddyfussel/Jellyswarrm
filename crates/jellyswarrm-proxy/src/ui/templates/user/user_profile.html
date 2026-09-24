@@ -17,6 +17,24 @@
     </div>
 </article>
 
+{% if oidc_enabled %}
+<article>
+    <header>
+        <strong>Single Sign-On</strong>
+    </header>
+    <p style="color: var(--pico-muted-color);">
+        Link your single sign-on account to sign in to this dashboard without your password.
+        Linking again replaces the previous link.
+    </p>
+    <form method="post" action="/{{ ui_route }}/oidc/link">
+        <button type="submit" class="secondary">
+            <i class="fas fa-key" style="margin-right: 0.5rem;"></i>
+            Link single sign-on
+        </button>
+    </form>
+</article>
+{% endif %}
+
 <article>
     <header>
         <strong>Change Password</strong>

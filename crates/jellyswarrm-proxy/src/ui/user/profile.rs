@@ -15,6 +15,7 @@ use crate::{encryption::Password, ui::auth::AuthenticatedUser, AppState};
 pub struct UserProfileTemplate {
     pub username: String,
     pub ui_route: String,
+    pub oidc_enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -31,6 +32,7 @@ pub async fn get_user_profile(
     let template = UserProfileTemplate {
         username: user.username,
         ui_route: state.get_ui_route().await,
+        oidc_enabled: state.config.read().await.oidc.is_some(),
     };
 
     match template.render() {

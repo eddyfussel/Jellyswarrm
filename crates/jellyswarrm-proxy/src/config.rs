@@ -260,6 +260,26 @@ pub struct DebugUser {
     pub password: Password,
 }
 
+/// OpenID Connect login for the web UI. Absent = password login only.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OidcConfig {
+    /// Issuer URL; the provider metadata is discovered from it.
+    pub issuer_url: String,
+    pub client_id: String,
+    /// Omit for a public client (the flow always uses PKCE).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<Password>,
+    /// Full callback URL as registered at the provider, e.g.
+    /// `https://jellyswarrm.example.com/ui/oidc/callback`. Explicit rather
+    /// than derived, so a TLS-terminating proxy cannot turn it into http://.
+    pub redirect_url: String,
+    /// Members of this group (from the `groups` claim) log in as admin.
+    /// Everyone else is matched to an existing Jellyswarrm user by
+    /// `preferred_username`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_group: Option<String>,
+}
+
 #[derive(Clone, Deserialize, Serialize, DefaultFromSerde)]
 pub struct AppConfig {
     #[serde(default = "default_server_id")]
@@ -338,6 +358,9 @@ pub struct AppConfig {
         alias = "deduplicate_movies"
     )]
     pub deduplicate_media: bool,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<OidcConfig>,
 }
 
 impl fmt::Debug for AppConfig {
@@ -371,6 +394,7 @@ impl fmt::Debug for AppConfig {
                 &self.auto_create_users_on_login,
             )
             .field("deduplicate_media", &self.deduplicate_media)
+            .field("oidc", &self.oidc)
             .finish()
     }
 }

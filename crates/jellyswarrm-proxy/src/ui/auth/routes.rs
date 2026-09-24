@@ -20,6 +20,7 @@ pub struct LoginTemplate {
     messages: Vec<Message>,
     next: Option<String>,
     ui_route: String,
+    oidc_enabled: bool,
 }
 
 // This allows us to extract the "next" field from the query string. We use this
@@ -34,6 +35,9 @@ pub fn router() -> axum::Router<AppState> {
         .route("/login", post(self::post::login))
         .route("/login", get(self::get::login))
         .route("/logout", get(self::get::logout))
+        .route("/oidc/login", get(super::oidc::login))
+        .route("/oidc/callback", get(super::oidc::callback))
+        .route("/oidc/link", post(super::oidc::link))
 }
 
 mod post {
@@ -100,6 +104,7 @@ mod get {
                 messages: messages.into_iter().collect(),
                 next,
                 ui_route: state.get_ui_route().await,
+                oidc_enabled: state.config.read().await.oidc.is_some(),
             }
             .render()
             .unwrap(),

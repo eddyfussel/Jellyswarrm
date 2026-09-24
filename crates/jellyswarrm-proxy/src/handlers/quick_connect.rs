@@ -752,7 +752,7 @@ fn map_jellyfin_auth_error(err: JellyfinApiError) -> QuickConnectAuthError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         config::{AppConfig, MediaStreamingMode, MIGRATOR},
@@ -772,7 +772,7 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
     };
 
-    async fn create_test_app_state() -> AppState {
+    pub(crate) async fn create_test_app_state() -> AppState {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
         let server_storage = ServerStorageService::new(pool.clone());

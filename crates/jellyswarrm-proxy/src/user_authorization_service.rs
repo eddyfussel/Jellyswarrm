@@ -682,6 +682,43 @@ impl UserAuthorizationService {
         Ok(user)
     }
 
+    /// Local user id linked to an OpenID Connect identity, if any.
+    pub async fn get_user_id_by_oidc_identity(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT user_id FROM oidc_identities WHERE issuer = ? AND subject = ?")
+            .bind(issuer)
+            .bind(subject)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    /// Link an OpenID Connect identity to a user, replacing the user's
+    /// previous link for the same issuer. Fails with a unique violation when
+    /// the identity is already linked to another user.
+    pub async fn link_oidc_identity(
+        &self,
+        user_id: &str,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM oidc_identities WHERE user_id = ? AND issuer = ?")
+            .bind(user_id)
+            .bind(issuer)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO oidc_identities (issuer, subject, user_id) VALUES (?, ?, ?)")
+            .bind(issuer)
+            .bind(subject)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await
+    }
+
     /// Get user by credentials
     pub async fn get_user_by_credentials(
         &self,
@@ -3501,5 +3538,75 @@ mod tests {
             .unwrap()
             .1;
         assert_eq!(sessions_after.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn oidc_identity_links_to_one_user_only() {
+        let (_pool, service) = setup_service().await;
+        let anna = service.create_user("anna", &"a".into()).await.unwrap();
+        let bob = service.create_user("bob", &"b".into()).await.unwrap();
+        let issuer = "https://idp.example";
+
+        assert_eq!(
+            service
+                .get_user_id_by_oidc_identity(issuer, "sub-a")
+                .await
+                .unwrap(),
+            None
+        );
+        service
+            .link_oidc_identity(&anna.id, issuer, "sub-a")
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .get_user_id_by_oidc_identity(issuer, "sub-a")
+                .await
+                .unwrap(),
+            Some(anna.id.clone())
+        );
+
+        // Another user cannot claim an identity that is already linked.
+        assert!(service
+            .link_oidc_identity(&bob.id, issuer, "sub-a")
+            .await
+            .is_err());
+        assert_eq!(
+            service
+                .get_user_id_by_oidc_identity(issuer, "sub-a")
+                .await
+                .unwrap(),
+            Some(anna.id.clone())
+        );
+
+        // Re-linking replaces the user's previous identity for that issuer.
+        service
+            .link_oidc_identity(&anna.id, issuer, "sub-a2")
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .get_user_id_by_oidc_identity(issuer, "sub-a")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            service
+                .get_user_id_by_oidc_identity(issuer, "sub-a2")
+                .await
+                .unwrap(),
+            Some(anna.id.clone())
+        );
+
+        // Deleting the user removes the link.
+        service.delete_user(&anna.id).await.unwrap();
+        assert_eq!(
+            service
+                .get_user_id_by_oidc_identity(issuer, "sub-a2")
+                .await
+                .unwrap(),
+            None
+        );
     }
 }

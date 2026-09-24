@@ -75,6 +75,14 @@
                     <input type="hidden" name="next" value="{{next}}" />
                     {% endif %}
                 </form>
+
+                {% if oidc_enabled %}
+                <a href="/{{ ui_route }}/oidc/login{% if let Some(next) = next %}?next={{ next|urlencode }}{% endif %}"
+                   role="button" class="secondary outline" style="width: 100%;">
+                    <i class="fas fa-key" style="margin-right: 0.5rem;"></i>
+                    Sign in with SSO
+                </a>
+                {% endif %}
             </article>
         </div>
 

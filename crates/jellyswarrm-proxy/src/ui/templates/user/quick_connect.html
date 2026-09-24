@@ -1,0 +1,31 @@
+<hgroup>
+    <h1>Quick Connect</h1>
+    <h2>Sign in a device with the code it shows</h2>
+</hgroup>
+
+<article>
+    <header>
+        <strong>Approve a device</strong>
+    </header>
+    <p style="color: var(--pico-muted-color);">
+        Choose "Quick Connect" on the login screen of your Jellyfin app, then enter the code it displays.
+        The device is signed in to your account with your connected servers.
+    </p>
+
+    <form id="quick_connect_form"
+          hx-post="/{{ ui_route }}/user/quick-connect"
+          hx-target="#quick_connect_message"
+          hx-swap="innerHTML"
+          hx-on::after-request="if(event.detail.successful) this.reset()">
+
+        <div id="quick_connect_message" style="margin-bottom: 1rem;"></div>
+
+        <label>
+            Code
+            <input name="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+                   pattern="[0-9]{6}" maxlength="6" placeholder="123456" required>
+        </label>
+
+        <button type="submit">Approve</button>
+    </form>
+</article>

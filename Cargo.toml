@@ -38,6 +38,7 @@ jellyfin-api = { path = "crates/jellyfin-api" }
 jellyswarrm-macros = { path = "crates/jellyswarrm-macros" }
 mime_guess = "2.0.5"
 mockall = "0.14.0"
+openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
 moka = { version = "0.12.12", features = ["future"] }
 percent-encoding = "2.3.2"
 proc-macro2 = "1.0.103"
