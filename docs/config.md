@@ -44,6 +44,8 @@ The table below lists all available configuration options:
 - The `session_key` is generated as a secure 64-byte key if not specified, and is stored in the config file for reuse.  
 - Each server now has its own streaming mode (`Redirect` or `Proxy`). For preconfigured servers, omit `media_streaming_mode` to use the default `Redirect`.
 - Configuration files are resolved from the data directory (`./data` by default), which can be overridden with `JELLYSWARRM_DATA_DIR`.
+- Environment keys map one-to-one onto the option names above (`JELLYSWARRM_PUBLIC_ADDRESS` → `public_address`). Nested fields use a double underscore, e.g. `JELLYSWARRM_DEBUG_USER__USERNAME`. Empty variables are treated as unset.
+- If the configuration cannot be loaded (for example an invalid `JELLYSWARRM_SESSION_KEY`), Jellyswarrm refuses to start instead of falling back to the default admin credentials. A failed reload from the settings page keeps the current configuration.
 
 ---
 
@@ -59,6 +61,8 @@ client_secret = "..."            # omit for a public client
 redirect_url = "https://jellyswarrm.example.com/ui/oidc/callback"
 admin_group = "jellyswarrm-admins" # optional
 ```
+
+The same keys work as environment variables with a double underscore for the section, e.g. `JELLYSWARRM_OIDC__ISSUER_URL` and `JELLYSWARRM_OIDC__CLIENT_ID`.
 
 - Register `redirect_url` exactly as written at the provider; it is not derived from the request, so a TLS-terminating proxy cannot change its scheme. The path is `/<ui_route>/oidc/callback` (with `url_prefix` in front if one is set).
 - The scopes `openid groups` are requested. Members of `admin_group` (from the `groups` claim) log in as the admin. Everyone else logs in to the Jellyswarrm account they have **linked**: sign in once with the account's password, open **Profile → Link single sign-on** and complete the provider login. The link stores the provider's issuer and subject, never a username, so renaming an account at the provider cannot redirect a login to someone else's account. No accounts are created; users get their Jellyswarrm account as before, by logging in once from a Jellyfin client.

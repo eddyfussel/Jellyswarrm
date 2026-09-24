@@ -8,7 +8,7 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use tower_sessions::cookie::Key;
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
 use jellyfin_api::ClientInfo;
@@ -411,8 +411,21 @@ fn dev_config_path() -> PathBuf {
     DATA_DIR.join(DEV_CONFIG_FILENAME)
 }
 
-/// Load configuration from known files and environment. Falls back to defaults.
-pub fn load_config() -> AppConfig {
+/// Environment source for `JELLYSWARRM_*` variables.
+///
+/// Keys are flat (`JELLYSWARRM_PUBLIC_ADDRESS` -> `public_address`); a single
+/// `_` must not act as the nesting separator, or every multi-word key turns
+/// into a nested table and is silently ignored. Nested keys use `__`
+/// (`JELLYSWARRM_DEBUG_USER__USERNAME`). Empty variables count as unset.
+fn env_source() -> config::Environment {
+    config::Environment::with_prefix("JELLYSWARRM")
+        .prefix_separator("_")
+        .separator("__")
+        .ignore_empty(true)
+}
+
+/// Load configuration from known files and environment.
+pub fn try_load_config() -> Result<AppConfig, config::ConfigError> {
     let path = config_path();
     let builder = if cfg!(debug_assertions) {
         // In debug mode, also load a dev-specific config file if it exists.
@@ -426,19 +439,28 @@ pub fn load_config() -> AppConfig {
                 config::File::with_name(dev_config_path().to_string_lossy().as_ref())
                     .required(false),
             )
-            .add_source(config::Environment::with_prefix("JELLYSWARRM").separator("_"))
+            .add_source(env_source())
     } else {
         config::Config::builder()
             .add_source(config::File::with_name(path.to_string_lossy().as_ref()).required(false))
-            .add_source(config::Environment::with_prefix("JELLYSWARRM").separator("_"))
+            .add_source(env_source())
     };
 
-    let config = match builder.build() {
-        Ok(c) => c.try_deserialize().unwrap_or_default(),
+    builder.build()?.try_deserialize()
+}
+
+/// Load configuration at startup and persist it on first run.
+///
+/// Exits the process when the configuration cannot be loaded: silently falling
+/// back to the built-in defaults would start the proxy with the default admin
+/// credentials.
+pub fn load_config() -> AppConfig {
+    let path = config_path();
+    let config = match try_load_config() {
+        Ok(config) => config,
         Err(e) => {
-            let config = AppConfig::default();
-            eprintln!("Failed to load config using defaults: {e}");
-            config
+            error!("Failed to load configuration: {e}");
+            std::process::exit(1);
         }
     };
 
@@ -554,5 +576,74 @@ impl<'de> serde::Deserialize<'de> for UrlSegment {
         } else {
             Ok(UrlSegment(t))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_from_env(vars: &[(&str, &str)]) -> Result<AppConfig, config::ConfigError> {
+        let vars = vars
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        config::Config::builder()
+            .add_source(env_source().source(Some(vars)))
+            .build()?
+            .try_deserialize()
+    }
+
+    #[test]
+    fn env_applies_multi_word_keys() {
+        let cfg = config_from_env(&[
+            ("JELLYSWARRM_PUBLIC_ADDRESS", "https://swarm.example.com"),
+            ("JELLYSWARRM_SERVER_NAME", "Swarm"),
+            ("JELLYSWARRM_AUTO_CREATE_USERS_ON_LOGIN", "false"),
+            ("JELLYSWARRM_USERNAME", "root"),
+        ])
+        .unwrap();
+
+        assert_eq!(cfg.public_address, "https://swarm.example.com");
+        assert_eq!(cfg.server_name, "Swarm");
+        assert!(!cfg.auto_create_users_on_login);
+        assert_eq!(cfg.username, "root");
+    }
+
+    #[test]
+    fn env_uses_double_underscore_for_nested_keys() {
+        let cfg = config_from_env(&[
+            ("JELLYSWARRM_DEBUG_USER__USERNAME", "debug"),
+            ("JELLYSWARRM_DEBUG_USER__PASSWORD", "secret"),
+        ])
+        .unwrap();
+
+        assert_eq!(cfg.debug_user.unwrap().username, "debug");
+    }
+
+    #[test]
+    fn env_ignores_kubernetes_service_links() {
+        let cfg = config_from_env(&[
+            ("JELLYSWARRM_PORT", "tcp://10.43.254.147:3000"),
+            ("JELLYSWARRM_PORT_3000_TCP_ADDR", "10.43.254.147"),
+            ("JELLYSWARRM_SERVICE_HOST", "10.43.254.147"),
+            ("JELLYSWARRM_PASSWORD", "not-the-default"),
+        ])
+        .unwrap();
+
+        assert_eq!(cfg.port, default_port());
+        assert_eq!(cfg.password.as_str(), "not-the-default");
+    }
+
+    #[test]
+    fn env_treats_empty_values_as_unset() {
+        let cfg = config_from_env(&[("JELLYSWARRM_URL_PREFIX", "")]).unwrap();
+
+        assert!(cfg.url_prefix.is_none());
+    }
+
+    #[test]
+    fn invalid_env_value_is_an_error_not_the_defaults() {
+        assert!(config_from_env(&[("JELLYSWARRM_SESSION_KEY", "not base64!")]).is_err());
     }
 }

@@ -111,7 +111,15 @@ pub async fn save_settings(State(state): State<AppState>, Form(form): Form<SaveF
 }
 
 pub async fn reload_config(State(state): State<AppState>) -> impl IntoResponse {
-    let new_cfg = crate::config::load_config();
+    let new_cfg = match crate::config::try_load_config() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            error!("Failed to reload configuration: {e}");
+            return Html(
+                "<div class=\"alert alert-error\">Could not reload the configuration. The previous configuration is still active.</div>",
+            );
+        }
+    };
     {
         let mut cfg = state.config.write().await;
         *cfg = new_cfg;
