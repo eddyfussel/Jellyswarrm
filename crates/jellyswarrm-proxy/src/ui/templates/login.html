@@ -82,6 +82,13 @@
                     <i class="fas fa-key" style="margin-right: 0.5rem;"></i>
                     Sign in with SSO
                 </a>
+                {% if oidc_admin_enabled %}
+                <a href="/{{ ui_route }}/oidc/login?admin=true{% if let Some(next) = next %}&next={{ next|urlencode }}{% endif %}"
+                   role="button" class="secondary outline" style="width: 100%; margin-top: 0.5rem;">
+                    <i class="fas fa-user-shield" style="margin-right: 0.5rem;"></i>
+                    Sign in with SSO as admin
+                </a>
+                {% endif %}
                 {% endif %}
             </article>
         </div>
