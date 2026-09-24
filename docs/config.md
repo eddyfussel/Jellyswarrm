@@ -44,3 +44,5 @@ The table below lists all available configuration options:
 - The `session_key` is generated as a secure 64-byte key if not specified, and is stored in the config file for reuse.  
 - Each server now has its own streaming mode (`Redirect` or `Proxy`). For preconfigured servers, omit `media_streaming_mode` to use the default `Redirect`.
 - Configuration files are resolved from the data directory (`./data` by default), which can be overridden with `JELLYSWARRM_DATA_DIR`.
+- Environment keys map one-to-one onto the option names above (`JELLYSWARRM_PUBLIC_ADDRESS` → `public_address`). Nested fields use a double underscore, e.g. `JELLYSWARRM_DEBUG_USER__USERNAME`. Empty variables are treated as unset.
+- If the configuration cannot be loaded (for example an invalid `JELLYSWARRM_SESSION_KEY`), Jellyswarrm refuses to start instead of falling back to the default admin credentials. A failed reload from the settings page keeps the current configuration.
