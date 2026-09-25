@@ -59,7 +59,7 @@
 {% if !unmapped_servers.is_empty() %}
     <hr>
     <h2>Available Servers</h2>
-    <p>Connect to these servers by providing your credentials.</p>
+    <p>Connect to these servers with the server's own Quick Connect (no password needed - you approve a code in that server's web UI) or with your username and password there.</p>
     
     <table role="grid">
         <thead>
@@ -91,12 +91,20 @@
                     </span>
                 </td>
                 <td>
+                    <button
+                        hx-post="/{{ ui_route }}/user/servers/{{ server.id }}/quick-connect"
+                        hx-target="#upstream-qc-{{ server.id }}"
+                        hx-swap="innerHTML"
+                        style="padding: 0.25rem 0.5rem; font-size: 0.8em;">
+                        Quick Connect
+                    </button>
                     <button 
                         onclick="openConnectModal('{{ server.id }}', '{{ server.name }}')"
                         class="contrast outline"
                         style="padding: 0.25rem 0.5rem; font-size: 0.8em;">
-                        Connect
+                        Password
                     </button>
+                    <div id="upstream-qc-{{ server.id }}"></div>
                 </td>
             </tr>
         {% endfor %}

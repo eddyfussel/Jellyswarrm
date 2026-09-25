@@ -60,10 +60,13 @@ client_id = "jellyswarrm"
 client_secret = "..."            # omit for a public client
 redirect_url = "https://jellyswarrm.example.com/ui/oidc/callback"
 admin_group = "jellyswarrm-admins" # optional
+user_group = "jellyfin"            # optional: create accounts on first sign-in
 ```
 
 The same keys work as environment variables with a double underscore for the section, e.g. `JELLYSWARRM_OIDC__ISSUER_URL` and `JELLYSWARRM_OIDC__CLIENT_ID`.
 
 - Register `redirect_url` exactly as written at the provider; it is not derived from the request, so a TLS-terminating proxy cannot change its scheme. The path is `/<ui_route>/oidc/callback` (with `url_prefix` in front if one is set).
 - The scopes `openid groups` are requested. The login page offers **Sign in with SSO**, which enters the Jellyswarrm account the user has **linked**, and, when `admin_group` is set, **Sign in with SSO as admin**, which requires membership in that group (from the `groups` claim). Someone who is both picks per login. To link an account: sign in once with the account's password, open **Profile → Link single sign-on** and complete the provider login. The link stores the provider's issuer and subject, never a username, so renaming an account at the provider cannot redirect a login to someone else's account. No accounts are created; users get their Jellyswarrm account as before, by logging in once from a Jellyfin client.
+- With `user_group` set, a member of that group who has no Jellyswarrm account yet gets one on their first **Sign in with SSO**: named after `preferred_username`, linked to their identity, and without any password - it can only be entered through single sign-on. If that name is already taken, the login is refused rather than attached to the existing account.
+- Such an account connects its servers without passwords too: under **Servers**, **Quick Connect** shows a code from that server, which the user approves in that server's own web UI (Jellyfin's Quick Connect page, reachable however that server lets them sign in). Jellyswarrm keeps the resulting upstream access token (encrypted with a key derived from `session_key`; changing `session_key` means reconnecting) instead of a password, and signs each device in upstream through the same Quick Connect mechanism. The upstream server must have Quick Connect enabled. To revoke, remove the "Jellyswarrm (<user>)" device in that server's dashboard.
 - Native Jellyfin apps cannot follow a browser login. They sign in with Quick Connect instead: pick "Quick Connect" in the app, then enter the code under **Quick Connect** in the web UI after signing in there. The device is logged in with the servers connected to that account. The admin account has no media access and cannot approve codes.

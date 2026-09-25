@@ -90,6 +90,27 @@ struct VerifiedIdentity {
     issuer: String,
     subject: String,
     groups: Vec<String>,
+    /// Only a name suggestion for a new account - never used to find one.
+    preferred_username: Option<String>,
+}
+
+/// A login refused for a reason the user can act on; shown verbatim.
+#[derive(Debug)]
+struct LoginRefusal(&'static str);
+
+impl std::fmt::Display for LoginRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for LoginRefusal {}
+
+/// A usable account name from the provider's `preferred_username`.
+fn account_name(preferred_username: Option<&str>) -> Option<String> {
+    let name = preferred_username?.trim();
+    (!name.is_empty() && name.chars().count() <= 64 && !name.chars().any(char::is_control))
+        .then(|| name.to_string())
 }
 
 async fn oidc_client(config: &OidcConfig) -> anyhow::Result<(OidcClient, reqwest::Client)> {
@@ -141,8 +162,8 @@ fn safe_next(next: Option<String>, fallback: String) -> String {
     }
 }
 
-fn is_admin(groups: &[String], admin_group: Option<&str>) -> bool {
-    admin_group.is_some_and(|admin| groups.iter().any(|group| group == admin))
+fn in_group(groups: &[String], group: Option<&str>) -> bool {
+    group.is_some_and(|wanted| groups.iter().any(|group| group == wanted))
 }
 
 /// Start an authorization request and remember its secrets in the session.
@@ -175,6 +196,7 @@ async fn start_flow(
             CsrfToken::new_random,
             Nonce::new_random,
         )
+        .add_scope(Scope::new("profile".to_string()))
         .add_scope(Scope::new("groups".to_string()))
         .set_pkce_challenge(pkce_challenge)
         .url();
@@ -278,7 +300,10 @@ pub async fn callback(
         }
         Err(e) => {
             warn!("OIDC login failed: {e:#}");
-            messages.error("Single sign-on failed");
+            match e.downcast_ref::<LoginRefusal>() {
+                Some(refusal) => messages.error(refusal.to_string()),
+                None => messages.error("Single sign-on failed"),
+            };
             Redirect::to(&login_url).into_response()
         }
     }
@@ -338,6 +363,9 @@ async fn verify_callback(
         issuer: id_claims.issuer().to_string(),
         subject: id_claims.subject().to_string(),
         groups: user_info.additional_claims().groups.clone(),
+        preferred_username: user_info
+            .preferred_username()
+            .map(|name| name.as_str().to_string()),
     })
 }
 
@@ -347,31 +375,54 @@ async fn log_in(
     identity: VerifiedIdentity,
     as_admin: bool,
 ) -> anyhow::Result<User> {
-    let admin_group = state
+    let (admin_group, user_group) = state
         .config
         .read()
         .await
         .oidc
         .as_ref()
-        .and_then(|config| config.admin_group.clone());
+        .map(|config| (config.admin_group.clone(), config.user_group.clone()))
+        .unwrap_or_default();
 
     let user_id = if as_admin {
-        if !is_admin(&identity.groups, admin_group.as_deref()) {
-            return Err(anyhow!("admin login requested outside the admin group"));
+        if !in_group(&identity.groups, admin_group.as_deref()) {
+            return Err(LoginRefusal("Your account is not allowed to sign in as admin").into());
         }
         "admin".to_string()
-    } else {
-        state
+    } else if let Some(user_id) = state
+        .user_authorization
+        .get_user_id_by_oidc_identity(&identity.issuer, &identity.subject)
+        .await?
+    {
+        user_id
+    } else if in_group(&identity.groups, user_group.as_deref()) {
+        let name = account_name(identity.preferred_username.as_deref()).ok_or(LoginRefusal(
+            "Your single sign-on account has no usable username",
+        ))?;
+        match state
             .user_authorization
-            .get_user_id_by_oidc_identity(&identity.issuer, &identity.subject)
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "identity {} at {} is not linked to a Jellyswarrm user",
-                    identity.subject,
-                    identity.issuer
+            .create_sso_user(&name, &identity.issuer, &identity.subject)
+            .await
+        {
+            Ok(user) => user.id,
+            // Never attach to an existing account by name.
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                return Err(LoginRefusal(
+                    "An account with your username already exists. Sign in with its password and link single sign-on under Profile.",
                 )
-            })?
+                .into());
+            }
+            Err(e) => return Err(e.into()),
+        }
+    } else {
+        warn!(
+            "identity {} at {} is not linked and not in the user group",
+            identity.subject, identity.issuer
+        );
+        return Err(LoginRefusal(
+            "Your single sign-on account is not linked to a Jellyswarrm account. Sign in with your password and link it under Profile.",
+        )
+        .into());
     };
 
     let user = auth_session
@@ -437,9 +488,19 @@ mod tests {
     #[test]
     fn only_admin_group_members_are_admin() {
         let groups = vec!["family".to_string(), "jellyswarrm-admins".to_string()];
-        assert!(is_admin(&groups, Some("jellyswarrm-admins")));
-        assert!(!is_admin(&groups, Some("other")));
+        assert!(in_group(&groups, Some("jellyswarrm-admins")));
+        assert!(!in_group(&groups, Some("other")));
         // Without an admin group nobody becomes admin via OIDC.
-        assert!(!is_admin(&groups, None));
+        assert!(!in_group(&groups, None));
+    }
+
+    #[test]
+    fn account_names_are_trimmed_and_bounded() {
+        assert_eq!(account_name(Some(" alice ")), Some("alice".to_string()));
+        assert_eq!(account_name(Some("  ")), None);
+        assert_eq!(account_name(None), None);
+        assert_eq!(account_name(Some("bad\nname")), None);
+        assert_eq!(account_name(Some(&"x".repeat(65))), None);
+        assert!(account_name(Some(&"x".repeat(64))).is_some());
     }
 }

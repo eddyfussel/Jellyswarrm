@@ -646,18 +646,6 @@ async fn authenticate_with_mapping_on_server(
     server: crate::server_storage::Server,
     server_mapping: crate::user_authorization_service::ServerMapping,
 ) -> Result<AuthenticateResponse, QuickConnectAuthError> {
-    let admin_password = state.get_admin_password().await;
-    let admin_password_hash: HashedPassword = (&admin_password).into();
-    let user_mapping_key = user.local_credential.mapping_key();
-
-    let mapped_password = state.user_authorization.decrypt_server_mapping_password(
-        &server_mapping,
-        &user_mapping_key,
-        &admin_password_hash,
-        None,
-        Some(&admin_password),
-    );
-
     let client_info = ClientInfo {
         client: authorization.client.clone(),
         device: authorization.device.clone(),
@@ -672,25 +660,51 @@ async fn authenticate_with_mapping_on_server(
     )
     .map_err(|e| QuickConnectAuthError::Internal(e.to_string()))?;
 
-    let mut auth_response: AuthenticateResponse = jellyfin_client
-        .authenticate_by_name_typed(
-            server_mapping.mapped_username.as_str(),
-            mapped_password.as_str(),
-        )
-        .await
-        .map_err(map_jellyfin_auth_error)?;
-
-    state
+    let token_key = state.upstream_token_key().await;
+    let mut auth_response: AuthenticateResponse = match state
         .user_authorization
-        .add_server_mapping(
-            &user.id,
-            &server,
-            &server_mapping.mapped_username,
-            &mapped_password,
-            Some(&user_mapping_key),
-        )
-        .await
-        .map_err(|e| QuickConnectAuthError::Internal(e.to_string()))?;
+        .mapping_token(&server_mapping, &token_key)
+    {
+        Some(base_token) => {
+            let base_token = base_token.map_err(QuickConnectAuthError::Internal)?;
+            mint_device_session(&state, &user, &server, &jellyfin_client, base_token).await?
+        }
+        None => {
+            let admin_password = state.get_admin_password().await;
+            let admin_password_hash: HashedPassword = (&admin_password).into();
+            let user_mapping_key = user.local_credential.mapping_key();
+
+            let mapped_password = state.user_authorization.decrypt_server_mapping_password(
+                &server_mapping,
+                &user_mapping_key,
+                &admin_password_hash,
+                None,
+                Some(&admin_password),
+            );
+
+            let auth_response = jellyfin_client
+                .authenticate_by_name_typed(
+                    server_mapping.mapped_username.as_str(),
+                    mapped_password.as_str(),
+                )
+                .await
+                .map_err(map_jellyfin_auth_error)?;
+
+            state
+                .user_authorization
+                .add_server_mapping(
+                    &user.id,
+                    &server,
+                    &server_mapping.mapped_username,
+                    &mapped_password,
+                    Some(&user_mapping_key),
+                )
+                .await
+                .map_err(|e| QuickConnectAuthError::Internal(e.to_string()))?;
+
+            auth_response
+        }
+    };
 
     let auth_token = auth_response.access_token.clone();
     let original_user_id = auth_response.user.id.clone();
@@ -732,6 +746,67 @@ async fn authenticate_with_mapping_on_server(
     );
 
     Ok(auth_response)
+}
+
+/// The device identity Jellyswarrm presents upstream for a user's
+/// token-backed mapping. Stable per user and server, so reconnecting replaces
+/// the previous token instead of piling up devices, and named after the user
+/// so the upstream's device list shows whose token it is.
+pub(crate) fn upstream_client_info(
+    user_id: &str,
+    username: &str,
+    server_id: crate::server_id::ServerId,
+) -> ClientInfo {
+    ClientInfo {
+        client: "Jellyswarrm Proxy".to_string(),
+        device: format!("Jellyswarrm ({username})"),
+        device_id: format!("jellyswarrm-{}-{user_id}", server_id.as_i64()),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+/// Get an upstream session for a device without a password: the device
+/// starts a Quick Connect request upstream, Jellyswarrm approves it with the
+/// user's stored token, and the device redeems it. Each device ends up with
+/// its own upstream token, as if it had logged in itself.
+async fn mint_device_session(
+    state: &AppState,
+    user: &crate::user_authorization_service::User,
+    server: &crate::server_storage::Server,
+    device_client: &JellyfinClient,
+    base_token: String,
+) -> Result<AuthenticateResponse, QuickConnectAuthError> {
+    let pending = device_client
+        .quick_connect_initiate()
+        .await
+        .map_err(|e| match e {
+            JellyfinApiError::Unauthorized | JellyfinApiError::Forbidden => {
+                QuickConnectAuthError::Internal(format!(
+                    "Quick Connect is disabled on server '{}'",
+                    server.name
+                ))
+            }
+            other => map_jellyfin_auth_error(other),
+        })?;
+
+    // A fresh client, not one from CLIENT_STORAGE: evicted cached clients log
+    // out, which would revoke the stored token.
+    let base_client = JellyfinClient::new_with_client(
+        server.url.as_str(),
+        upstream_client_info(&user.id, &user.original_username, server.id),
+        state.reqwest_client.clone(),
+    )
+    .map_err(|e| QuickConnectAuthError::Internal(e.to_string()))?;
+    base_client.with_token(base_token).await;
+    base_client
+        .quick_connect_authorize(&pending.code)
+        .await
+        .map_err(map_jellyfin_auth_error)?;
+
+    device_client
+        .authenticate_with_quick_connect_typed(&pending.secret)
+        .await
+        .map_err(map_jellyfin_auth_error)
 }
 
 fn map_jellyfin_auth_error(err: JellyfinApiError) -> QuickConnectAuthError {
@@ -1301,5 +1376,211 @@ pub(crate) mod tests {
         assert!(user_ids_match(simple, hyphenated));
         assert!(user_ids_match(simple, simple));
         assert!(!user_ids_match(simple, "feedfacefeedfacefeedfacefeedface"));
+    }
+
+    fn upstream_auth_response(token: &str) -> AuthenticateResponse {
+        AuthenticateResponse {
+            user: User {
+                name: "alice".to_string(),
+                server_id: "upstream-server".to_string(),
+                id: "upstream-user-id".to_string(),
+                policy: UserPolicy {
+                    is_administrator: false,
+                    sync_play_access: SyncPlayUserAccessType::None,
+                    extra: HashMap::new(),
+                },
+                extra: HashMap::new(),
+            },
+            session_info: SessionInfo {
+                user_id: "upstream-user-id".to_string(),
+                user_name: "alice".to_string(),
+                server_id: "upstream-server".to_string(),
+                extra: HashMap::new(),
+            },
+            access_token: token.to_string(),
+            server_id: "upstream-server".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn token_mapping_mints_a_device_session_without_a_password() {
+        use wiremock::matchers::query_param;
+
+        let state = create_test_app_state().await;
+        let upstream = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/QuickConnect/Initiate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Secret": "device-secret", "Code": "424242", "Authenticated": false
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/QuickConnect/Authorize"))
+            .and(query_param("Code", "424242"))
+            .and(|req: &wiremock::Request| {
+                req.headers
+                    .get("Authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.ends_with(", Token=\"base-token\""))
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(true))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateWithQuickConnect"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(upstream_auth_response("device-token")),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateByName"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let server_id = state
+            .server_storage
+            .add_server("Upstream", &upstream.uri(), 100, MediaStreamingMode::Proxy)
+            .await
+            .unwrap();
+        let server = state
+            .server_storage
+            .get_server_by_id(server_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let user = state
+            .user_authorization
+            .create_sso_user("alice", "https://idp.example", "sub-e")
+            .await
+            .unwrap();
+        state
+            .user_authorization
+            .add_token_server_mapping(
+                &user.id,
+                server.id,
+                server.url.as_str(),
+                "alice",
+                "base-token",
+                &state.upstream_token_key().await,
+            )
+            .await
+            .unwrap();
+        let mapping = state
+            .user_authorization
+            .get_server_mapping(&user.id, &server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let device = Authorization {
+            client: "Jellyfin Android TV".to_string(),
+            device: "Chromecast".to_string(),
+            device_id: "tv-1".to_string(),
+            version: "0.19.7".to_string(),
+            token: None,
+        };
+        let response = authenticate_with_mapping_on_server(
+            state.clone(),
+            device,
+            user.clone(),
+            server,
+            mapping,
+        )
+        .await
+        .unwrap();
+
+        // The client gets Jellyswarrm's own token, the upstream session is stored.
+        assert_eq!(response.access_token, user.virtual_key);
+        let sessions = state
+            .user_authorization
+            .get_user_sessions(&user.id, None)
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].0.jellyfin_token, "device-token");
+        // The token mapping was not rewritten into a password mapping.
+        let mapping = state
+            .user_authorization
+            .list_server_mappings(&user.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(mapping.upstream_token.is_some());
+    }
+
+    #[tokio::test]
+    async fn revoked_upstream_token_fails_as_invalid_credentials() {
+        let state = create_test_app_state().await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/QuickConnect/Initiate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Secret": "s", "Code": "111111", "Authenticated": false
+            })))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/QuickConnect/Authorize"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&upstream)
+            .await;
+
+        let server_id = state
+            .server_storage
+            .add_server("Upstream", &upstream.uri(), 100, MediaStreamingMode::Proxy)
+            .await
+            .unwrap();
+        let server = state
+            .server_storage
+            .get_server_by_id(server_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let user = state
+            .user_authorization
+            .create_sso_user("alice", "https://idp.example", "sub-e")
+            .await
+            .unwrap();
+        state
+            .user_authorization
+            .add_token_server_mapping(
+                &user.id,
+                server.id,
+                server.url.as_str(),
+                "alice",
+                "revoked",
+                &state.upstream_token_key().await,
+            )
+            .await
+            .unwrap();
+        let mapping = state
+            .user_authorization
+            .get_server_mapping(&user.id, &server)
+            .await
+            .unwrap()
+            .unwrap();
+        let device = Authorization {
+            client: "App".to_string(),
+            device: "Phone".to_string(),
+            device_id: "phone-1".to_string(),
+            version: "1".to_string(),
+            token: None,
+        };
+
+        let result =
+            authenticate_with_mapping_on_server(state, device, user, server, mapping).await;
+        assert!(matches!(
+            result,
+            Err(QuickConnectAuthError::InvalidCredentials)
+        ));
     }
 }

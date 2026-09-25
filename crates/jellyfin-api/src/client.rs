@@ -1,6 +1,7 @@
 use crate::error::Error;
 use crate::models::{
-    AuthResponse, IncludeBaseItemFields, IncludeItemTypes, MediaFoldersResponse, User,
+    AuthResponse, IncludeBaseItemFields, IncludeItemTypes, MediaFoldersResponse,
+    QuickConnectResult, User,
 };
 use reqwest::{header, Client, StatusCode};
 use serde::de::DeserializeOwned;
@@ -216,6 +217,57 @@ impl JellyfinClient {
         *write_guard = Some(response.access_token);
         info!("Authenticated user: {}", response.user.name);
         Ok(response.user)
+    }
+
+    /// Start a Quick Connect request for this client's device. The returned
+    /// code is approved by a logged-in user; the secret redeems it.
+    pub async fn quick_connect_initiate(&self) -> Result<QuickConnectResult, Error> {
+        self.request(reqwest::Method::POST, "QuickConnect/Initiate", None)
+            .await
+    }
+
+    /// Current state of a Quick Connect request.
+    pub async fn quick_connect_state(&self, secret: &str) -> Result<QuickConnectResult, Error> {
+        self.request(
+            reqwest::Method::GET,
+            &format!("QuickConnect/Connect?Secret={secret}"),
+            None,
+        )
+        .await
+    }
+
+    /// Approve a Quick Connect code for the user this client is logged in as.
+    pub async fn quick_connect_authorize(&self, code: &str) -> Result<(), Error> {
+        self.request_no_content(
+            reqwest::Method::POST,
+            &format!("QuickConnect/Authorize?Code={code}"),
+            None,
+        )
+        .await
+    }
+
+    /// Redeem an approved Quick Connect request for a session on this
+    /// client's device.
+    pub async fn authenticate_with_quick_connect_typed<T: DeserializeOwned>(
+        &self,
+        secret: &str,
+    ) -> Result<T, Error> {
+        let body = json!({ "Secret": secret });
+        self.request(
+            reqwest::Method::POST,
+            "Users/AuthenticateWithQuickConnect",
+            Some(&body),
+        )
+        .await
+    }
+
+    pub async fn authenticate_with_quick_connect(
+        &self,
+        secret: &str,
+    ) -> Result<AuthResponse, Error> {
+        let response: AuthResponse = self.authenticate_with_quick_connect_typed(secret).await?;
+        *self.auth_token.write().await = Some(response.access_token.clone());
+        Ok(response)
     }
 
     pub async fn logout(&self) -> Result<(), Error> {
@@ -453,5 +505,78 @@ mod tests {
             Some("body { background: black; }".to_string())
         );
         assert_eq!(config.splashscreen_enabled, Some(true));
+    }
+
+    #[tokio::test]
+    async fn quick_connect_round_trip() {
+        use wiremock::matchers::{body_json, query_param};
+
+        let mock_server = MockServer::start().await;
+        let pending = json!({"Secret": "s3cret", "Code": "123456", "Authenticated": false});
+        let approved = json!({"Secret": "s3cret", "Code": "123456", "Authenticated": true});
+
+        Mock::given(method("POST"))
+            .and(path("/QuickConnect/Initiate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pending))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/QuickConnect/Connect"))
+            .and(query_param("Secret", "s3cret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(approved))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/QuickConnect/Authorize"))
+            .and(query_param("Code", "123456"))
+            // wiremock's header matcher splits values on commas, so check
+            // the token inside the MediaBrowser header by hand.
+            .and(|req: &wiremock::Request| {
+                req.headers
+                    .get("Authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.ends_with(", Token=\"base\""))
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!(true)))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateWithQuickConnect"))
+            .and(body_json(json!({"Secret": "s3cret"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "AccessToken": "device_token",
+                "User": {"Id": "u1", "Name": "alice", "ServerId": "srv"}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client_info = ClientInfo {
+            client: "c".to_string(),
+            device: "d".to_string(),
+            device_id: "id".to_string(),
+            version: "v".to_string(),
+        };
+        let client = JellyfinClient::new(&mock_server.uri(), client_info).unwrap();
+
+        let started = client.quick_connect_initiate().await.unwrap();
+        assert_eq!(started.code, "123456");
+        assert!(!started.authenticated);
+        assert!(
+            client
+                .quick_connect_state("s3cret")
+                .await
+                .unwrap()
+                .authenticated
+        );
+
+        client.with_token("base".to_string()).await;
+        client.quick_connect_authorize("123456").await.unwrap();
+
+        let session = client
+            .authenticate_with_quick_connect("s3cret")
+            .await
+            .unwrap();
+        assert_eq!(session.user.name, "alice");
+        assert_eq!(client.get_token().await.as_deref(), Some("device_token"));
     }
 }
