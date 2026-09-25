@@ -118,8 +118,23 @@ pub struct ServerMapping {
     pub server_url: String,
     pub mapped_username: String,
     pub mapped_password: EncryptedPassword,
+    /// Upstream access token obtained through Quick Connect, encrypted with
+    /// [`upstream_token_key`]. When set, `mapped_password` is empty and the
+    /// token is used instead.
+    pub upstream_token: Option<EncryptedPassword>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Key for upstream tokens: derived from the server's session key rather than
+/// a user's password (token-backed users have none). Domain-separated because
+/// the same session key also signs the UI's cookies.
+pub fn upstream_token_key(session_key: &[u8]) -> HashedPassword {
+    use base64::prelude::*;
+    HashedPassword::from_password(&format!(
+        "jellyswarrm-upstream-token-v1:{}",
+        BASE64_STANDARD.encode(session_key)
+    ))
 }
 
 impl<'r> sqlx::FromRow<'r, SqliteRow> for ServerMapping {
@@ -131,6 +146,7 @@ impl<'r> sqlx::FromRow<'r, SqliteRow> for ServerMapping {
             server_url: row.try_get("server_url")?,
             mapped_username: row.try_get("mapped_username")?,
             mapped_password: row.try_get("mapped_password")?,
+            upstream_token: row.try_get("upstream_token")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
@@ -719,6 +735,136 @@ impl UserAuthorizationService {
         tx.commit().await
     }
 
+    /// Create an account for a single sign-on identity and link it, in one
+    /// transaction so a failed link never leaves an unlinked account behind.
+    /// The account gets a random, discarded password: it can only ever be
+    /// entered through single sign-on. Fails with a unique violation when the
+    /// username is taken - an existing account is never taken over by name.
+    pub async fn create_sso_user(
+        &self,
+        username: &str,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<User, sqlx::Error> {
+        use rand::Rng;
+        let secret: [u8; 32] = rand::rng().random();
+        let local_credential = LocalCredential::from_password(&Password::from(hex::encode(secret)));
+        let username_key = Self::normalized_username_key(username);
+        let virtual_key = generate_token();
+        let user_id = generate_token();
+        let now = chrono::Utc::now();
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO users
+                (id, virtual_key, original_username, original_password_hash, local_credential_kind, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&user_id)
+        .bind(&virtual_key)
+        .bind(&username_key)
+        .bind(local_credential.stored_hash())
+        .bind(local_credential.kind())
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("INSERT INTO oidc_identities (issuer, subject, user_id) VALUES (?, ?, ?)")
+            .bind(issuer)
+            .bind(subject)
+            .bind(&user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        info!("Created single sign-on user: {}", username_key);
+        Ok(User {
+            id: user_id,
+            virtual_key,
+            original_username: username_key,
+            local_credential,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    /// Add or replace a server mapping backed by an upstream access token
+    /// instead of a password. Clears any stored password, and ends the
+    /// mapping's existing sessions since they belong to the old credential.
+    pub async fn add_token_server_mapping(
+        &self,
+        user_id: &str,
+        server_id: ServerId,
+        server_url: &str,
+        upstream_username: &str,
+        token: &str,
+        key: &HashedPassword,
+    ) -> Result<i64, sqlx::Error> {
+        let encrypted = encrypt_password(&Password::from(token), key)
+            .map_err(|e| sqlx::Error::Protocol(format!("Encryption failed: {e}")))?;
+        let now = chrono::Utc::now();
+
+        let mut tx = self.pool.begin().await?;
+        let mapping_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO server_mappings
+            (user_id, server_id, server_url, mapped_username, mapped_password, upstream_token, created_at, updated_at)
+            VALUES (?, ?, ?, ?, '', ?, ?, ?)
+            ON CONFLICT(user_id, server_id) DO UPDATE SET
+                server_url = excluded.server_url,
+                mapped_username = excluded.mapped_username,
+                mapped_password = '',
+                upstream_token = excluded.upstream_token,
+                updated_at = excluded.updated_at
+            RETURNING id
+            "#,
+        )
+        .bind(user_id)
+        .bind(server_id.as_i64())
+        .bind(server_url)
+        .bind(upstream_username)
+        .bind(encrypted)
+        .bind(now)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM authorization_sessions WHERE mapping_id = ?")
+            .bind(mapping_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        info!(
+            "Added token mapping for user {} to server {}",
+            user_id, server_url
+        );
+        Ok(mapping_id)
+    }
+
+    /// The mapping's upstream token: `None` for a password mapping,
+    /// `Some(Err)` when the token can no longer be decrypted (for example
+    /// after a session key change - the user has to reconnect). Never falls
+    /// back to the password.
+    pub fn mapping_token(
+        &self,
+        mapping: &ServerMapping,
+        key: &HashedPassword,
+    ) -> Option<Result<String, String>> {
+        let token = mapping.upstream_token.as_ref()?;
+        Some(
+            decrypt_password(token, key)
+                .map(|token| token.into_inner())
+                .map_err(|e| {
+                    format!(
+                        "cannot decrypt upstream token of mapping {}: {e}",
+                        mapping.id
+                    )
+                }),
+        )
+    }
+
     /// Get user by credentials
     pub async fn get_user_by_credentials(
         &self,
@@ -821,6 +967,7 @@ impl UserAuthorizationService {
                 server_url = excluded.server_url,
                 mapped_username = excluded.mapped_username,
                 mapped_password = excluded.mapped_password,
+                upstream_token = NULL,
                 updated_at = excluded.updated_at
             RETURNING id
             "#,
@@ -921,7 +1068,7 @@ impl UserAuthorizationService {
     ) -> Result<Option<ServerMapping>, sqlx::Error> {
         let mapping = sqlx::query_as::<_, ServerMapping>(
             r#"
-            SELECT id, user_id, server_id, server_url, mapped_username, mapped_password, created_at, updated_at
+            SELECT id, user_id, server_id, server_url, mapped_username, mapped_password, upstream_token, created_at, updated_at
             FROM server_mappings
             WHERE user_id = ? AND server_id = ?
             "#,
@@ -941,7 +1088,7 @@ impl UserAuthorizationService {
     ) -> Result<Vec<ServerMapping>, sqlx::Error> {
         let mappings = sqlx::query_as::<_, ServerMapping>(
             r#"
-            SELECT id, user_id, server_id, server_url, mapped_username, mapped_password, created_at, updated_at
+            SELECT id, user_id, server_id, server_url, mapped_username, mapped_password, upstream_token, created_at, updated_at
             FROM server_mappings
             WHERE user_id = ?
             ORDER BY server_url
@@ -1403,9 +1550,9 @@ impl UserAuthorizationService {
         // 2. Re-encrypt all server mappings
         let mappings = sqlx::query_as::<_, ServerMapping>(
             r#"
-            SELECT id, user_id, server_id, server_url, mapped_username, mapped_password, created_at, updated_at
+            SELECT id, user_id, server_id, server_url, mapped_username, mapped_password, upstream_token, created_at, updated_at
             FROM server_mappings
-            WHERE user_id = ?
+            WHERE user_id = ? AND upstream_token IS NULL
             "#,
         )
         .bind(user_id)
@@ -3608,5 +3755,180 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn sso_user_is_linked_and_has_no_usable_password() {
+        let (_pool, service) = setup_service().await;
+        let issuer = "https://idp.example";
+
+        let user = service
+            .create_sso_user("Alice", issuer, "sub-e")
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .get_user_id_by_oidc_identity(issuer, "sub-e")
+                .await
+                .unwrap(),
+            Some(user.id.clone())
+        );
+        // Neither an empty nor a guessed password opens the account.
+        for guess in ["", "Alice", "password"] {
+            assert!(service
+                .get_user_by_credentials("Alice", &Password::from(guess))
+                .await
+                .unwrap()
+                .is_none());
+        }
+        assert!(matches!(
+            user.local_credential,
+            LocalCredential::Password(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn sso_user_never_takes_over_an_existing_name() {
+        let (_pool, service) = setup_service().await;
+        let existing = service.create_user("anna", &"pw".into()).await.unwrap();
+        let issuer = "https://idp.example";
+
+        let err = service
+            .create_sso_user(" Anna ", issuer, "sub-x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, sqlx::Error::Database(ref e) if e.is_unique_violation()));
+        // Rolled back as a whole: no account, no link.
+        assert_eq!(
+            service
+                .get_user_id_by_oidc_identity(issuer, "sub-x")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(service.list_users().await.unwrap().len(), 1);
+        assert_eq!(service.list_users().await.unwrap()[0].id, existing.id);
+    }
+
+    #[tokio::test]
+    async fn token_and_password_mappings_replace_each_other() {
+        let (pool, service) = setup_service().await;
+        let server_id = insert_test_server(&pool, "Upstream", "http://upstream:8096").await;
+        let user = service.create_user("anna", &"pw".into()).await.unwrap();
+        let key = upstream_token_key(b"session-key");
+
+        service
+            .add_token_server_mapping(
+                &user.id,
+                server_id,
+                "http://upstream:8096",
+                "anna",
+                "tok-1",
+                &key,
+            )
+            .await
+            .unwrap();
+        let mapping = service
+            .get_server_mapping_by_server_id(&user.id, server_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapping.mapped_password.as_str(), "");
+        assert_eq!(
+            service.mapping_token(&mapping, &key),
+            Some(Ok("tok-1".to_string()))
+        );
+        // A different key cannot read it, and there is no password fallback.
+        assert!(matches!(
+            service.mapping_token(&mapping, &upstream_token_key(b"other")),
+            Some(Err(_))
+        ));
+
+        // A later password connect drops the token ...
+        let server = Server {
+            id: server_id,
+            name: "Upstream".to_string(),
+            url: crate::server_url::ServerUrl::parse("http://upstream:8096").unwrap(),
+            priority: 100,
+            media_streaming_mode: crate::config::MediaStreamingMode::Proxy,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        service
+            .add_server_mapping(
+                &user.id,
+                &server,
+                "anna",
+                &"secret".into(),
+                Some(&user.local_credential.mapping_key()),
+            )
+            .await
+            .unwrap();
+        let mapping = service
+            .list_server_mappings(&user.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(mapping.upstream_token.is_none());
+        assert_eq!(service.mapping_token(&mapping, &key), None);
+
+        // ... and a token connect drops the password again.
+        service
+            .add_token_server_mapping(
+                &user.id,
+                server_id,
+                "http://upstream:8096",
+                "anna",
+                "tok-2",
+                &key,
+            )
+            .await
+            .unwrap();
+        let mapping = service
+            .get_server_mapping(&user.id, &server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapping.mapped_password.as_str(), "");
+        assert_eq!(
+            service.mapping_token(&mapping, &key),
+            Some(Ok("tok-2".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn password_change_leaves_token_mappings_alone() {
+        let (pool, service) = setup_service().await;
+        let server_id = insert_test_server(&pool, "Upstream", "http://upstream:8096").await;
+        let user = service.create_user("anna", &"old".into()).await.unwrap();
+        let key = upstream_token_key(b"session-key");
+        service
+            .add_token_server_mapping(
+                &user.id,
+                server_id,
+                "http://upstream:8096",
+                "anna",
+                "tok",
+                &key,
+            )
+            .await
+            .unwrap();
+
+        assert!(service
+            .update_user_password(&user.id, &"old".into(), &"new".into(), &"admin".into())
+            .await
+            .unwrap());
+
+        let mapping = service
+            .get_server_mapping_by_server_id(&user.id, server_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            service.mapping_token(&mapping, &key),
+            Some(Ok("tok".to_string()))
+        );
+        assert_eq!(mapping.mapped_password.as_str(), "");
     }
 }

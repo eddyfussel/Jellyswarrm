@@ -197,6 +197,10 @@ pub fn ui_routes() -> axum::Router<AppState> {
             "/user/servers/{id}/connect",
             post(user::servers::connect_server),
         )
+        .route(
+            "/user/servers/{id}/quick-connect",
+            get(user::upstream_connect::status).post(user::upstream_connect::start),
+        )
         .route("/user/media", get(user::media::get_user_media))
         .route(
             "/user/media/server/{server_id}/libraries",

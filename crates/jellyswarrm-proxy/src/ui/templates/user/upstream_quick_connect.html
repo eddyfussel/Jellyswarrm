@@ -1,0 +1,16 @@
+{% if let Some(error) = error %}
+<div role="alert" style="background-color: #c62828; color: white; padding: 0.5rem 0.75rem; border-radius: 0.25rem; margin-top: 0.5rem; font-size: 0.9em;">
+    <i class="fas fa-exclamation-circle" style="margin-right: 0.5rem;"></i> {{ error }}
+</div>
+{% else %}
+<div hx-get="{{ poll_url }}" hx-trigger="every 3s" hx-swap="outerHTML" style="margin-top: 0.5rem; font-size: 0.9em;">
+    <p style="margin-bottom: 0.25rem;">
+        Code <strong style="font-size: 1.4em; letter-spacing: 0.15em;">{{ code }}</strong>
+    </p>
+    <p style="margin-bottom: 0;">
+        Open <a href="{{ approve_url }}" target="_blank" rel="noopener noreferrer">{{ server_name }} → Quick Connect</a>,
+        sign in there if asked, and enter this code.
+        <i class="fas fa-circle-notch fa-spin" style="margin-left: 0.25rem;"></i>
+    </p>
+</div>
+{% endif %}

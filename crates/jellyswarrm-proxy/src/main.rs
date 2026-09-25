@@ -151,6 +151,12 @@ impl AppState {
         config.url_prefix.as_ref().map(|prefix| prefix.to_string())
     }
 
+    /// Key that encrypts upstream tokens of token-backed server mappings.
+    pub async fn upstream_token_key(&self) -> crate::encryption::HashedPassword {
+        let config = self.config.read().await;
+        crate::user_authorization_service::upstream_token_key(&config.session_key)
+    }
+
     pub async fn get_admin_password(&self) -> Password {
         let config = self.config.read().await;
         config.password.clone()

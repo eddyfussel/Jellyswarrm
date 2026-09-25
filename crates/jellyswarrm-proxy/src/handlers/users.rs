@@ -160,6 +160,15 @@ pub async fn handle_authenticate_by_name(
 
         if !server_mappings.is_empty() {
             for server_mapping in server_mappings {
+                // Token-backed mappings have no password to send; their
+                // devices sign in through Quick Connect instead.
+                if server_mapping.upstream_token.is_some() {
+                    info!(
+                        "Skipping token-backed mapping for user '{}' on server {} during password login",
+                        &payload.username, server_mapping.server_id
+                    );
+                    continue;
+                }
                 if let Some(pos) = servers
                     .iter()
                     .position(|s| s.id == server_mapping.server_id)

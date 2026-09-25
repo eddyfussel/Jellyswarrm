@@ -26,6 +26,17 @@ pub struct AuthResponse {
     pub user: User,
 }
 
+/// A pending or approved Quick Connect request on a Jellyfin server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuickConnectResult {
+    #[serde(rename = "Secret")]
+    pub secret: String,
+    #[serde(rename = "Code")]
+    pub code: String,
+    #[serde(rename = "Authenticated")]
+    pub authenticated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaFolder {
     #[serde(rename = "Name")]

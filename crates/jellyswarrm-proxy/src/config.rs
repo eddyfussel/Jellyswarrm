@@ -278,6 +278,12 @@ pub struct OidcConfig {
     /// `preferred_username`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin_group: Option<String>,
+    /// Members of this group who have no Jellyswarrm account yet get one on
+    /// their first single sign-on (named after `preferred_username`, linked
+    /// to their identity, no password). Unset = accounts are only linked,
+    /// never created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_group: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize, DefaultFromSerde)]

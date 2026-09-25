@@ -47,6 +47,36 @@ pub async fn authenticate_user_on_server(
         Err(e) => return Err(format!("Database error: {}", e)),
     };
 
+    // Token-backed mapping (connected through upstream Quick Connect): use
+    // the token directly, on a fresh client - cached clients log out when
+    // evicted, which would revoke it.
+    let token_key = state.upstream_token_key().await;
+    if let Some(token) = state.user_authorization.mapping_token(&mapping, &token_key) {
+        let token = token?;
+        let token_client = JellyfinClient::new_with_client(
+            server_url.as_ref(),
+            crate::handlers::quick_connect::upstream_client_info(
+                &user.id,
+                &user.username,
+                server.id,
+            ),
+            state.reqwest_client.clone(),
+        )
+        .map_err(|e| format!("Failed to create client: {e}"))?;
+        token_client.with_token(token).await;
+        return match token_client.get_me().await {
+            Ok(jellyfin_user) => Ok((Arc::new(token_client), jellyfin_user, public_info)),
+            Err(e) => {
+                tracing::warn!(
+                    "Stored upstream token for server {} rejected: {}",
+                    server.id,
+                    e
+                );
+                Err("Quick Connect login expired - reconnect this server".to_string())
+            }
+        };
+    }
+
     let admin_password = state.get_admin_password().await;
     let admin_password_hash: HashedPassword = (&admin_password).into();
 
