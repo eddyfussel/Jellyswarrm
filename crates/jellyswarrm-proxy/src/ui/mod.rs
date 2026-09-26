@@ -219,6 +219,8 @@ pub fn ui_routes() -> axum::Router<AppState> {
             "/user/profile/password",
             post(user::profile::post_user_password),
         )
+        .route("/player-login", get(user::player_login::page))
+        .route("/player-login/session", post(user::player_login::session))
         .route(
             "/user/quick-connect",
             get(user::quick_connect::get_quick_connect)

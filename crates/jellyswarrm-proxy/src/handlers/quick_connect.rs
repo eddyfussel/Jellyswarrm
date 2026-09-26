@@ -543,33 +543,68 @@ pub async fn handle_authenticate_with_quick_connect(
         })?
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
+    let authorization = effective_quick_connect_authorization(&headers, &session, &user.id);
+    let result = sign_in_device(&state, &user, authorization).await;
+    state.quick_connect.remove_session(&request.secret);
+
+    result
+        .map(crate::sessions::authentication_response)
+        .map_err(|e| e.status())
+}
+
+/// Why a device could not be signed in for a user.
+#[derive(Debug, PartialEq)]
+pub(crate) enum DeviceSignInError {
+    NoServers,
+    NoConnectedServers,
+    AllServersRefused,
+    Internal,
+}
+
+impl DeviceSignInError {
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            Self::NoServers => StatusCode::NOT_FOUND,
+            Self::NoConnectedServers | Self::AllServersRefused => StatusCode::UNAUTHORIZED,
+            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+/// Sign a device in for a user who is already authorized: open an upstream
+/// session for it on every connected server (password or token mapping) and
+/// return the response a Jellyfin client expects, carrying Jellyswarrm's own
+/// token. Callers decide who the user is; this does no authorization itself.
+pub(crate) async fn sign_in_device(
+    state: &AppState,
+    user: &crate::user_authorization_service::User,
+    authorization: Authorization,
+) -> Result<AuthenticateResponse, DeviceSignInError> {
     let mut servers = state
         .server_storage
         .list_servers()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| DeviceSignInError::Internal)?;
 
     if servers.is_empty() {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(DeviceSignInError::NoServers);
     }
 
     let server_mappings = state
         .user_authorization
         .list_server_mappings(&user.id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| DeviceSignInError::Internal)?;
 
     if server_mappings.is_empty() {
         warn!(
-            "Quick Connect user '{}' has no server mappings",
+            "User '{}' has no server mappings to sign a device in with",
             user.original_username
         );
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(DeviceSignInError::NoConnectedServers);
     }
 
     let mut auth_tasks = Vec::with_capacity(server_mappings.len());
-
-    let authorization = effective_quick_connect_authorization(&headers, &session, &user.id);
 
     for server_mapping in server_mappings {
         if let Some(pos) = servers
@@ -620,15 +655,10 @@ pub async fn handle_authenticate_with_quick_connect(
         }
     }
 
-    state.quick_connect.remove_session(&request.secret);
-
-    if successful_auths.is_empty() {
-        Err(StatusCode::UNAUTHORIZED)
-    } else {
-        Ok(crate::sessions::authentication_response(
-            successful_auths[0].clone(),
-        ))
-    }
+    successful_auths
+        .into_iter()
+        .next()
+        .ok_or(DeviceSignInError::AllServersRefused)
 }
 
 #[derive(Debug)]

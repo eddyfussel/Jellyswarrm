@@ -61,6 +61,10 @@ struct OidcFlow {
     /// linked user. Chosen up front, because one person can be both.
     #[serde(default)]
     as_admin: bool,
+    /// Started from the web player's login page: on success, continue to the
+    /// page that signs the player in instead of the dashboard.
+    #[serde(default)]
+    player: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +72,8 @@ pub struct LoginQuery {
     next: Option<String>,
     #[serde(default)]
     admin: bool,
+    #[serde(default)]
+    player: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +180,7 @@ async fn start_flow(
     next: Option<String>,
     link_user_id: Option<String>,
     as_admin: bool,
+    player: bool,
 ) -> Response {
     let login_url = format!("/{}/login", state.get_ui_route().await);
     let Some(config) = state.config.read().await.oidc.clone() else {
@@ -208,6 +215,7 @@ async fn start_flow(
         next,
         link_user_id,
         as_admin,
+        player,
     };
     if let Err(e) = session.insert(FLOW_SESSION_KEY, flow).await {
         warn!("Failed to store OIDC flow state: {e}");
@@ -222,9 +230,23 @@ pub async fn login(
     State(state): State<AppState>,
     session: Session,
     messages: Messages,
-    Query(LoginQuery { next, admin }): Query<LoginQuery>,
+    Query(LoginQuery {
+        next,
+        admin,
+        player,
+    }): Query<LoginQuery>,
 ) -> Response {
-    start_flow(&state, &session, messages, next, None, admin).await
+    // The admin has no media, so there is no admin login for the player.
+    start_flow(
+        &state,
+        &session,
+        messages,
+        next,
+        None,
+        admin,
+        player && !admin,
+    )
+    .await
 }
 
 /// Link the logged-in user's account to their provider identity.
@@ -242,7 +264,16 @@ pub async fn link(
     if user.role != UserRole::User {
         return StatusCode::FORBIDDEN.into_response();
     }
-    start_flow(&state, &session, messages, None, Some(user.id), false).await
+    start_flow(
+        &state,
+        &session,
+        messages,
+        None,
+        Some(user.id),
+        false,
+        false,
+    )
+    .await
 }
 
 pub async fn callback(
@@ -295,6 +326,20 @@ pub async fn callback(
     match logged_in {
         Ok(user) => {
             info!("OIDC login successful for {}", user.username);
+            if flow.player {
+                // One-shot permission for the player sign-in that follows.
+                if let Err(e) = auth_session
+                    .session
+                    .insert(
+                        crate::ui::user::player_login::PENDING_KEY,
+                        chrono::Utc::now().timestamp(),
+                    )
+                    .await
+                {
+                    warn!("Failed to mark player sign-in as pending: {e}");
+                }
+                return Redirect::to(&format!("/{ui_route}/player-login")).into_response();
+            }
             messages.success(format!("Successfully logged in as {}", user.username));
             Redirect::to(&safe_next(flow.next, home)).into_response()
         }

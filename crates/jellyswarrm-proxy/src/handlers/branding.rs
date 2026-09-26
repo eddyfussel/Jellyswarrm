@@ -31,6 +31,17 @@ async fn fetch_custom_css(server_storage: &ServerStorageService, servers: &[Serv
     String::new()
 }
 
+/// "Sign in with SSO" for the web client's login page. Starts the dashboard's
+/// OIDC flow in player mode, which ends by signing this browser's web client in.
+fn sso_button(ui_route: &str) -> String {
+    format!(
+        "<form method=\"get\" action=\"/{ui_route}/oidc/login\">\
+         <input type=\"hidden\" name=\"player\" value=\"true\">\
+         <button type=\"submit\" is=\"emby-button\" class=\"raised button-submit block emby-button\">\
+         <span>Sign in with SSO</span></button></form>"
+    )
+}
+
 pub async fn handle_branding(
     State(state): State<AppState>,
 ) -> Result<Json<BrandingConfig>, StatusCode> {
@@ -58,6 +69,13 @@ pub async fn handle_branding(
         message.push_str("No servers configured.");
         String::new()
     };
+
+    // With single sign-on configured, the login page offers it instead of
+    // listing the upstream servers. A form rather than a link: the web client
+    // opens every link in the disclaimer in a new tab.
+    if state.config.read().await.oidc.is_some() {
+        message = sso_button(&state.get_ui_route().await);
+    }
 
     let config = BrandingConfig {
         login_disclaimer: message,
@@ -184,5 +202,13 @@ mod tests {
         let custom_css = fetch_custom_css(&storage, &servers).await;
 
         assert_eq!(custom_css, "body { color: fallback; }");
+    }
+
+    #[test]
+    fn sso_button_is_a_same_tab_form_into_the_player_flow() {
+        let html = sso_button("ui");
+        assert!(html.starts_with("<form method=\"get\" action=\"/ui/oidc/login\">"));
+        assert!(html.contains("name=\"player\" value=\"true\""));
+        assert!(!html.contains("<a "));
     }
 }
