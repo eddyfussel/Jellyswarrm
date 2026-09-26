@@ -43,10 +43,11 @@ Jellyswarrm is a reverse proxy that lets you combine multiple Jellyfin servers i
 * **API Compatibility** – Appears as a normal Jellyfin server, so existing apps and tools still work.
 * **Server Federation** – Automatically sync users across connected servers.
 * **User Page** – Personal dashboard for managing credentials and libraries. 
+* **QuickConnect** – Sign in on one device by approving the code from another authenticated device.
+* **Single Sign-On** – Sign in to the dashboard and the web player through an OpenID Connect provider; accounts and server connections work without passwords ([setup](#single-sign-on-openid-connect)).
 
 ### ⚠️ In Progress
 
-* **QuickConnect** – Sign in on one device by approving the code from another authenticated device.
 * **Websocket Support** – Needed for real-time features like SyncPlay (not fully reliable yet).
 * **Audio Streaming** – Progressive and HLS audio use the video streaming path.
 * **Automatic Bitrate Adjustment** – Stream quality based on network conditions isn’t supported yet.
@@ -83,6 +84,64 @@ Once the container is running, open:
 * **Bundled Jellyfin Web Client:** `http://[JELLYSWARRM_HOST]:[JELLYSWARRM_PORT]`
 
 For advanced configuration options, check out the [ui](./docs/ui.md) and [configuration](./docs/config.md) documentation.
+
+---
+
+## Single Sign-On (OpenID Connect)
+
+Jellyswarrm can use an OpenID Connect provider (Pocket ID, Authelia, Authentik, Keycloak, ...) for its logins:
+
+* the **dashboard** at `/ui` gets *Sign in with SSO*, plus *Sign in with SSO as admin* for members of an admin group;
+* the **web player** gets *Sign in with SSO* on its login page;
+* **native apps** sign in with Quick Connect, approved from the dashboard.
+
+With a user group configured, nobody needs a password: accounts are created on the first sign-in, and upstream Jellyfin servers are connected through their own Quick Connect, so Jellyswarrm stores an access token instead of a password.
+
+<p align="center">
+  <img src="./media/sso/dashboard_login.png" alt="Dashboard login with single sign-on" height="300px" style="margin-right:10px;">
+  <img src="./media/sso/player_login.png" alt="Web player login with single sign-on" height="300px">
+</p>
+
+### 1. Register Jellyswarrm at your provider
+
+Create an OIDC client:
+
+* **Type:** public client with PKCE. A confidential client with a secret works too.
+* **Callback URL:** `https://<your-jellyswarrm-host>/ui/oidc/callback`, exactly as written.
+* **Scopes:** `openid profile groups`. The `groups` claim decides who may sign in as admin and who gets an account.
+
+### 2. Configure Jellyswarrm
+
+```yaml
+    environment:
+      - JELLYSWARRM_OIDC__ISSUER_URL=https://auth.example.com
+      - JELLYSWARRM_OIDC__CLIENT_ID=<client id>
+      # - JELLYSWARRM_OIDC__CLIENT_SECRET=<secret>   # only for a confidential client
+      - JELLYSWARRM_OIDC__REDIRECT_URL=https://jellyswarrm.example.com/ui/oidc/callback
+      - JELLYSWARRM_OIDC__ADMIN_GROUP=jellyswarrm-admins   # may use "Sign in with SSO as admin"
+      - JELLYSWARRM_OIDC__USER_GROUP=jellyfin-users        # get an account on first sign-in
+```
+
+The same settings can go into an `[oidc]` section of `jellyswarrm.toml`; see the [configuration docs](./docs/config.md#single-sign-on-openid-connect).
+
+### 3. First sign-in and connecting servers
+
+1. Open `/ui` and choose **Sign in with SSO**. On the first sign-in, a member of the user group gets an account named after their username at the provider.
+2. Under **Servers**, choose **Quick Connect** next to a server. Jellyswarrm shows a code from that server.
+3. Open the server's own web UI (the link next to the code), sign in there however that server allows, and approve the code on its Quick Connect page. The server then appears under *Your Connected Servers*.
+
+The server must have Quick Connect enabled. Connecting with a username and password (*Password*) still works too.
+
+<p align="center">
+  <img src="./media/sso/connect_server.png" alt="Connecting a server through its own Quick Connect" width="80%">
+</p>
+
+### 4. Watching
+
+* **Web player:** choose **Sign in with SSO** on its login page. After the provider login, the player opens signed in.
+* **Apps (TV, phone):** choose **Quick Connect** in the app and enter the code it shows on the dashboard's **Quick Connect** page.
+
+An account that already exists with a password can link single sign-on under **Profile → Link single sign-on**.
 
 ---
 
