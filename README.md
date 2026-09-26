@@ -1,3 +1,6 @@
+> [!NOTE]
+> **This is a vibe-coded fork** of [LLukas22/Jellyswarrm](https://github.com/LLukas22/Jellyswarrm). With an AI coding assistant (Claude) it adds a few features on top of upstream: single sign-on through OpenID Connect for the dashboard and the web player, password-free accounts and server connections via the upstream servers' own Quick Connect, and a Quick Connect security fix. Images are published as `ghcr.io/eddyfussel/jellyswarrm`. Everything else is upstream's work - use at your own risk; the original project remains the reference.
+
 <h1 align="center">Jellyswarrm</h1>
 
 <h3 align="center">Many servers. Single experience.</h3>
@@ -45,13 +48,13 @@ Jellyswarrm is a reverse proxy that lets you combine multiple Jellyfin servers i
 * **User Page** – Personal dashboard for managing credentials and libraries. 
 * **QuickConnect** – Sign in on one device by approving the code from another authenticated device.
 * **Single Sign-On** – Sign in to the dashboard and the web player through an OpenID Connect provider; accounts and server connections work without passwords ([setup](#single-sign-on-openid-connect)).
+* **Websocket Support** – Real-time connection for remote control and SyncPlay (SyncPlay itself is not extensively tested yet).
+* **Audio Streaming** – Progressive and HLS audio, served through the same streaming path as video.
+* **Bitrate Detection** – The web client's bandwidth test runs through Jellyswarrm, so it picks a fitting streaming quality.
 
-### ⚠️ In Progress
+### ⚠️ Not Supported Yet
 
-* **Websocket Support** – Needed for real-time features like SyncPlay (not fully reliable yet).
-* **Audio Streaming** – Progressive and HLS audio use the video streaming path.
-* **Automatic Bitrate Adjustment** – Stream quality based on network conditions isn’t supported yet.
-* **Media Management** – Features like adding or deleting media libraries through Jellyswarrm are not implemented yet.
+* **Media Management** – Adding or deleting media libraries on the upstream servers through Jellyswarrm.
 
 ---
 
