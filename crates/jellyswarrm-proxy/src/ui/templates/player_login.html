@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+
+{% block title %}Signing in - Jellyswarrm{% endblock %}
+
+{% block body %}
+    <main class="container">
+        <div style="max-width: 400px; margin: 4rem auto; text-align: center;">
+            <img src="/{{ ui_route }}/resources/icon.svg" alt="Jellyswarrm Logo" style="width: 96px; height: 96px;">
+            <p id="player-login-status" aria-live="polite" style="margin-top: 1.5rem;">
+                <i class="fas fa-circle-notch fa-spin" style="margin-right: 0.5rem;"></i>
+                Signing in the player...
+            </p>
+            <p id="player-login-back" hidden>
+                <a href="/{{ ui_route }}">Open the dashboard</a>
+            </p>
+        </div>
+    </main>
+    <script id="player-login-config" type="application/json">{{ config_json|safe }}</script>
+    <script>
+    (async () => {
+        const cfg = JSON.parse(document.getElementById('player-login-config').textContent);
+        const fail = (message) => {
+            document.getElementById('player-login-status').textContent = message;
+            document.getElementById('player-login-back').hidden = false;
+        };
+        // Same browser name detection spirit as jellyfin-web's apphost; only
+        // informational - sessions are matched by client and device id.
+        const deviceName = () => {
+            const ua = navigator.userAgent;
+            if (/Edg\//.test(ua)) return 'Edge';
+            if (/OPR\//.test(ua)) return 'Opera';
+            if (/Firefox\//.test(ua)) return 'Firefox';
+            if (/Chrome\//.test(ua)) return 'Chrome';
+            if (/Safari\//.test(ua)) return 'Safari';
+            return 'Web Browser';
+        };
+        try {
+            // The web client's device id, created the way jellyfin-web does
+            // if this browser never opened the player. Sent as-is: the web
+            // client URL-encodes it in its headers and the server decodes it.
+            let deviceId = localStorage.getItem('_deviceId2');
+            if (!deviceId) {
+                deviceId = btoa([navigator.userAgent, Date.now()].join('|')).replaceAll('=', '1');
+                localStorage.setItem('_deviceId2', deviceId);
+            }
+            const response = await fetch(cfg.sessionUrl, {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    device_id: deviceId,
+                    device_name: deviceName(),
+                    app_version: cfg.appVersion,
+                }),
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                fail(result.error || `Sign-in failed (${response.status})`);
+                return;
+            }
+            // Store the login where the web client keeps it (jellyfin-apiclient
+            // Credentials): one entry per server, matched by Id and address.
+            const address = location.origin + cfg.webBase;
+            const credentials = JSON.parse(localStorage.getItem('jellyfin_credentials') || '{}');
+            const servers = (credentials.Servers || []).filter(
+                (server) => server.Id !== result.ServerId && server.ManualAddress !== address
+            );
+            servers.push({
+                Id: result.ServerId,
+                ManualAddress: address,
+                LastConnectionMode: 2,
+                DateLastAccessed: Date.now(),
+                UserId: result.User.Id,
+                AccessToken: result.AccessToken,
+            });
+            credentials.Servers = servers;
+            localStorage.setItem('jellyfin_credentials', JSON.stringify(credentials));
+            // Keep the token even if "remember me" was once unticked.
+            localStorage.setItem('enableAutoLogin', 'true');
+            location.replace(address + '/#/home');
+        } catch (e) {
+            fail(`Sign-in failed: ${e.message}`);
+        }
+    })();
+    </script>
+{% endblock %}
